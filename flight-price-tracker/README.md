@@ -1,52 +1,56 @@
 # Real-time Flight Price Tracker
 
-Tool nay duoc dieu chinh theo workflow reverse engineering API availability: dung RapidAPI Client hoac DevTools de xac thuc request, sau do de Python worker goi truc tiep endpoint that moi 60 giay thay vi phu thuoc vao proxy trung gian.
+A service-based system for tracking domestic Vietnam airline prices and aviation fuel costs in near real-time. Instead of crawling HTML, this project uses an **API-first approach**: capture the actual browser request with DevTools, then have a Python worker replay that request on a schedule — no browser automation required.
 
-## Kien truc Docker Compose
+---
 
-- `db-service`: PostgreSQL luu luong nong de dashboard doc nhanh
-- `scraper-service`: worker Python async goi endpoint availability moi 60 giay
-- `fuel-worker`: worker Python lay Brent + USD/VND, tinh chi phi Jet A1, va ghi snapshot CSV thang
-- `dashboard-service`: Streamlit doc read-only tu PostgreSQL de ve bieu do thoi gian thuc
-- `raw_data/`: luong lanh chua snapshot JSONL theo ngay cua API gia ve, de theo doi bang DVC
-- `fuel_data/`: luong lanh chua snapshot CSV thang cua chi so nhien lieu, de theo doi bang DVC
+## Architecture
 
-## 1) Reverse engineering API availability
+The system runs as four Docker Compose services:
 
-1. Mo trang tim chuyen bay cua Vietnam Airlines o che do an danh.
-2. Nhap route vi du `HAN -> SGN`, chon ngay bay, bam tim kiem.
-3. Mo `F12 -> Network -> Fetch/XHR`.
-4. Tim request tra ve JSON co danh sach itinerary, legs, segments, price hoac fare option.
-5. Copy cac thong tin sau vao `.env`:
-   - `VNA_API_URL`
-   - `VNA_API_METHOD`
-  - `VNA_PARSER_MODE`
-   - `VNA_HEADERS_TEMPLATE`
-   - `VNA_QUERY_TEMPLATE` neu la GET
-   - `VNA_PAYLOAD_TEMPLATE` neu la POST
-  - `VNA_BEARER_TOKEN`, `VNA_SESSION_ID`, `VNA_COOKIE` neu request can token, cookie, hoac session
+| Service | Description |
+|---|---|
+| `db-service` | PostgreSQL — stores hot-path price ticks and fuel metrics |
+| `scraper-service` | Async Python worker — polls the availability endpoint on a schedule |
+| `fuel-worker` | Python worker — fetches Brent crude price + USD/VND rate, estimates Jet A1 cost, writes monthly CSV snapshots |
+| `dashboard-service` | Streamlit app — read-only connection to PostgreSQL, displays real-time charts |
 
-Worker se tu dong thay placeholder `{origin}`, `{destination}`, `{travel_date}` trong payload/query moi chu ky quet.
+Cold-storage data lakes:
+- `raw_data/YYYY/MM/DD/vna_raw_YYYYMMDD.jsonl` — full request/response snapshots per scrape cycle
+- `fuel_data/YYYY/MM/fuel_metrics_YYYYMM.csv` — monthly fuel metric snapshots
 
-Neu dung schema itinerary availability cua Skyscanner, hay doi:
+---
 
-- `VNA_API_METHOD=GET`
-- `VNA_PARSER_MODE=skyscanner_itineraries`
-- `VNA_COOKIE` bang cookie session hien tai
+## Quick Start
 
-Neu dung schema fare-family/brand chi tiet khac, hay doi:
+### 1. Configure environment
 
-- `VNA_API_URL` sang endpoint availability/offer chi tiet
-- `VNA_PARSER_MODE=fare_options` neu payload tra ve danh sach fare family/brand theo tung chuyen bay
-- `VNA_PARSER_MODE=auto` neu ban dang thu nghiem va muon scraper thu parser chi tiet truoc roi fallback ve `best_price_calendar`
+Copy the example env file and fill in your values:
 
-## 2) Cau hinh route va ngay quet
+```powershell
+Copy-Item .env.example .env
+```
 
-Danh sach thi truong nam trong [scraper-worker/config/flights.json](c:\Lab aPhong\flight-price-tracker\scraper-worker\config\flights.json).
+Key variables:
 
-Luu y: voi mot so endpoint availability kieu Skyscanner, URL co the gan voi mot search session cu the. Khi do route/day trong `flights.json` chi nen de mot cau hinh khop voi request dang dung; neu muon doi ngay hoac route that su, ban can bat lai request session moi.
+| Variable | Purpose |
+|---|---|
+| `VNA_API_URL` | Target availability endpoint URL |
+| `VNA_API_METHOD` | `GET` or `POST` |
+| `VNA_PARSER_MODE` | `best_price_calendar`, `fare_options`, `skyscanner_itineraries`, or `auto` |
+| `VNA_HEADERS_TEMPLATE` | JSON object of request headers |
+| `VNA_QUERY_TEMPLATE` | URL query params (GET) |
+| `VNA_PAYLOAD_TEMPLATE` | Request body (POST) |
+| `VNA_BEARER_TOKEN` | Bearer token if required |
+| `VNA_COOKIE` | Session cookie if required |
+| `POSTGRES_USER` / `POSTGRES_PASSWORD` | DB credentials |
+| `DASHBOARD_DB_USER` / `DASHBOARD_DB_PASSWORD` | Read-only dashboard credentials |
 
-Vi du, worker se quet tung route voi cac moc ngay `7`, `14`, `30` ngay toi:
+The worker replaces `{origin}`, `{destination}`, and `{travel_date}` placeholders in the payload or query string on every cycle.
+
+### 2. Configure routes
+
+Edit [`scraper-worker/config/flights.json`](scraper-worker/config/flights.json):
 
 ```json
 [
@@ -58,112 +62,187 @@ Vi du, worker se quet tung route voi cac moc ngay `7`, `14`, `30` ngay toi:
 ]
 ```
 
-## 3) Luong nong trong PostgreSQL
+> **Note:** For session-bound endpoints (e.g. Skyscanner-style), the URL is tied to a specific search session. Keep only the route matching your captured request; refresh `VNA_COOKIE` and possibly `VNA_API_URL` when the session expires.
 
-Bang nong la `flight_price_ticks` voi cau truc toi gian:
-
-- `timestamp`
-- `flight_number`
-- `departure_time`
-- `fare_class`
-- `price`
-
-Dashboard chi doc bang nay de ve bieu do realtime.
-
-## 4) Luong lanh + DVC
-
-Moi lan worker goi API, toan bo request/response duoc gom thanh mot snapshot va append vao file JSONL theo ngay:
-
-- `raw_data/YYYY/MM/DD/vna_raw_YYYYMMDD.jsonl`
-
-De dua vao DVC:
-
-1. `dvc init`
-2. `dvc add raw_data`
-3. `git add raw_data.dvc .gitignore .dvc/`
-4. Cau hinh remote va day du lieu:
-   - `dvc remote add -d storage <s3-or-gdrive-or-minio-url>`
-   - `dvc push`
-
-Khi can backtest, chi can `dvc pull` dung version du lieu tho cua tung thoi diem.
-
-## 5) Khoi dong he thong
-
-1. Tao `.env` tu [flight-price-tracker/.env.example](c:\Lab aPhong\flight-price-tracker\.env.example).
-2. Cap nhat [scraper-worker/config/flights.json](c:\Lab aPhong\flight-price-tracker\scraper-worker\config\flights.json) theo route can theo doi.
-3. Chay:
+### 3. Start all services
 
 ```powershell
 docker compose up --build -d
 ```
 
-4. Xem log worker:
+### 4. View logs
 
 ```powershell
 docker compose logs -f scraper-service
+docker compose logs -f fuel-worker
 ```
 
-5. Mo dashboard:
+### 5. Open dashboard
 
-- `http://localhost:8501`
+```
+http://localhost:8501
+```
 
-## 6) Fuel Worker va cong thuc Jet A1
+---
 
-Worker nhien lieu bo sung mot chi bao macro cho bai toan gia ve. Cong thuc duoc ap dung la:
+## Reverse Engineering the Availability API
+
+The scraper does not use a pre-built API client — you capture your own request:
+
+1. Open the airline booking page in incognito mode.
+2. Enter a route (e.g. `HAN → SGN`), select a date, and click search.
+3. Open **F12 → Network → Fetch/XHR**.
+4. Find the request that returns JSON with itineraries, legs, segments, or fare options.
+5. Copy the URL, method, headers, and body into your `.env`.
+
+**Parser modes:**
+
+| Mode | When to use |
+|---|---|
+| `best_price_calendar` | Calendar-style response with best price per date |
+| `fare_options` | Fare family / brand response per flight |
+| `skyscanner_itineraries` | Skyscanner-style itinerary availability |
+| `auto` | Try detailed parser first, fallback to `best_price_calendar` |
+
+---
+
+## Database Schema
+
+### `flight_price_ticks`
+
+Stores one row per fare tick captured each scrape cycle.
+
+| Column | Type | Description |
+|---|---|---|
+| `timestamp` | `TIMESTAMPTZ` | When the snapshot was taken |
+| `flight_number` | `TEXT` | Flight identifier |
+| `departure_time` | `TIMESTAMPTZ` | Scheduled departure |
+| `fare_class` | `TEXT` | Fare class / brand name |
+| `price` | `NUMERIC(12,2)` | Price in VND |
+
+### `fuel_metrics`
+
+Stores one row per fuel worker cycle, including data provenance fields.
+
+| Column | Type | Description |
+|---|---|---|
+| `timestamp` | `TIMESTAMPTZ` | When the snapshot was taken |
+| `brent_price_usd` | `NUMERIC(12,4)` | Brent crude price (USD/barrel) |
+| `exchange_rate` | `NUMERIC(12,2)` | USD/VND exchange rate |
+| `jet_a1_est_vnd` | `NUMERIC(14,2)` | Estimated Jet A1 price (VND/liter) |
+| `han_sgn_fuel_cost` | `NUMERIC(18,2)` | Estimated fuel cost for HAN–SGN (VND) |
+| `brent_source` | `TEXT` | Source used for Brent price |
+| `exchange_rate_source` | `TEXT` | Source used for exchange rate |
+| `brent_price_timestamp` | `TIMESTAMPTZ` | Timestamp of the Brent data point |
+| `exchange_rate_timestamp` | `TIMESTAMPTZ` | Timestamp of the exchange rate data point |
+| `is_fallback` | `BOOLEAN` | `true` if a fallback source was used |
+| `source_note` | `TEXT` | Free-text note about data quality |
+
+---
+
+## Jet A1 Fuel Cost Formula
 
 $$
-Gia\_JetA1\_VN = \left( \frac{Brent \times he\_so\_proxy \times USD/VND}{158.987} \right) + Thue\_NK + Thue\_BVMT + Phi\_Premium
+P_{\text{JetA1}} = \left( \frac{P_{\text{Brent}} \times k_{\text{proxy}} \times R_{\text{USD/VND}}}{158.987} \right) + T_{\text{import}} + T_{\text{env}} + P_{\text{premium}}
 $$
 
-Trong implementation hien tai:
+$$
+C_{\text{HAN-SGN}} = P_{\text{JetA1}} \times V_{\text{liters}}
+$$
 
-- `Brent` duoc lay qua `yfinance` voi ma `BZ=F`
-- `USD/VND` duoc lay tu XML/JSON cua Vietcombank qua `VCB_EXCHANGE_URL`
-- cac hang so thue, premium, va muc tieu thu nhien lieu cua chuyen `HAN-SGN` nam trong [fuel-worker/config/pricing.json](c:\Lab aPhong\flight-price-tracker\fuel-worker\config\pricing.json)
+Default constants from [`fuel-worker/config/pricing.json`](fuel-worker/config/pricing.json):
 
-Bang `fuel_metrics` trong PostgreSQL luu:
+| Parameter | Value |
+|---|---|
+| `mops_proxy_multiplier` | 1.0 |
+| `barrel_to_liters` | 158.987 L |
+| `import_tax_vnd_per_liter` | 0 VND |
+| `environment_tax_vnd_per_liter` | 1,000 VND |
+| `premium_vnd_per_liter` | 1,800 VND |
+| `han_sgn_estimated_liters` | 9,800 L |
 
-- `timestamp`
-- `brent_price_usd`
-- `exchange_rate`
-- `jet_a1_est_vnd`
-- `han_sgn_fuel_cost`
-- `brent_source`
-- `exchange_rate_source`
-- `brent_price_timestamp`
-- `exchange_rate_timestamp`
-- `is_fallback`
-- `source_note`
+- **Brent price** — fetched via `yfinance` symbol `BZ=F`; falls back to Stooq if blocked.
+- **USD/VND rate** — fetched from the Vietcombank XML/JSON endpoint (`VCB_EXCHANGE_URL`).
 
-Du lieu luu lanh duoc append vao file CSV theo thang:
+---
 
-- `fuel_data/YYYY/MM/fuel_metrics_YYYYMM.csv`
+## Fuel Worker Schedule
 
-## 7) Cau hinh lich fuel worker
+| Variable | Description |
+|---|---|
+| `FUEL_SCHEDULE_MODE` | `daily`, `hourly`, or `interval` |
+| `FUEL_DAILY_HOUR` | Hour to run in daily mode (e.g. `8` = 08:00) |
+| `FUEL_TIMEZONE` | Timezone for daily scheduling |
+| `FUEL_HOURLY_INTERVAL` | Run every N hours in hourly mode |
+| `FUEL_INTERVAL_MINUTES` | Run every N minutes in interval mode |
+| `FUEL_RUN_ON_STARTUP` | `true` to capture one sample immediately on container start |
 
-Bien moi trong [.env.example](c:\Lab aPhong\flight-price-tracker\.env.example):
+---
 
-- `FUEL_SCHEDULE_MODE=daily` de chay 1 lan/ngay, `hourly` de chay theo gio, hoac `interval` de chay theo phut
-- `FUEL_DAILY_HOUR=8` de chay luc 8h sang theo `FUEL_TIMEZONE`
-- `FUEL_HOURLY_INTERVAL=1` neu theo doi futures moi gio
-- `FUEL_INTERVAL_MINUTES=5` neu muon cap nhat moi 5 phut o che do `interval`
-- `FUEL_RUN_ON_STARTUP=true` de nap ngay mot mau khi container vua khoi dong
+## Cold Storage & DVC
 
-## 8) DVC cho fuel metrics
+### Flight raw data
 
-De dua snapshot kinh te vi mo len S3 bang DVC:
+```powershell
+dvc init
+dvc add raw_data
+git add raw_data.dvc .gitignore .dvc/
+dvc remote add -d storage <s3-or-minio-url>
+dvc push
+```
 
-1. `dvc add fuel_data`
-2. `git add fuel_data.dvc .gitignore`
-3. `dvc remote add -d storage s3://<bucket-name>/<path>`
-4. `dvc push`
+### Fuel metrics
 
-Luc train mo hinh time-series cho gia ve, ban co the `dvc pull` dung snapshot cua thang can backtest.
+```powershell
+dvc add fuel_data
+git add fuel_data.dvc .gitignore
+dvc remote add -d storage s3://<bucket>/<path>
+dvc push
+```
 
-## 9) Luu y van hanh
+To backtest or replay historical data, run `dvc pull` for the specific version you need.
 
-- Worker duoc boc bang `try/except`, neu request loi o phut hien tai thi chi log loi va chay tiep o phut sau.
-- Parser dang dung heuristic + parser chuyen biet cho `best_price_calendar`, `fare_options`, va `skyscanner_itineraries`.
-- Neu dung request availability gan voi session/cookie, can refresh `VNA_COOKIE` va co the ca `VNA_API_URL` khi session het han.
-- Fuel worker cung fail-safe theo chu ky; neu Yahoo Finance hoac endpoint Vietcombank loi, worker chi log loi va doi den chu ky ke tiep.
-- Luon tuan thu terms of service cua nguon du lieu.
+---
+
+## Operational Notes
+
+- Both workers are wrapped in `try/except` — a failed cycle is logged and the worker continues on the next tick.
+- If the API endpoint is session-bound, refresh `VNA_COOKIE` (and possibly `VNA_API_URL`) when the session expires.
+- The `is_fallback` and `source_note` columns in `fuel_metrics` let you distinguish live data from fallback values in the dashboard.
+- Always comply with the terms of service of any data source you use.
+
+---
+
+## Project Structure
+
+```
+flight-price-tracker/
+├── docker-compose.yml
+├── db/
+│   ├── 01-schema.sql                    # Table definitions
+│   ├── 02-grants.sh                     # Read-only dashboard user grants
+│   └── 03-fuel-metrics-provenance.sql   # Migration for provenance columns
+├── scraper-worker/
+│   ├── app/                             # Scraper worker source
+│   └── config/flights.json              # Route configuration
+├── fuel-worker/
+│   ├── app/                             # Fuel worker source
+│   └── config/pricing.json              # Jet A1 cost parameters
+├── dashboard-service/
+│   └── app.py                           # Streamlit dashboard
+├── raw_data/                            # Cold storage — JSONL snapshots by date
+└── fuel_data/                           # Cold storage — CSV snapshots by month
+```
+
+---
+
+## Tech Stack
+
+| Component | Technology | Reason |
+|---|---|---|
+| HTTP client | `httpx` | Async, HTTP/2, easy header/cookie control |
+| Database | PostgreSQL 16 | Stable, fast queries, time-series friendly |
+| Dashboard | Streamlit + Plotly | Fast to build, interactive charts, read-only |
+| Containerization | Docker Compose | One-command startup, isolated services |
+| Data versioning | DVC | Version cold-storage snapshots alongside code |
+| Fuel pricing | `yfinance` + Vietcombank | Real Brent futures + official VND rate |
